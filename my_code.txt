@@ -1,0 +1,194 @@
+import pandas as pd
+print("Hello, Colab!")
+
+
+import ast
+import re
+import unicodedata
+import numpy as np
+import pandas as pd
+
+# ============================ SETTINGS ======================================
+MOVIES_PATH = "final_dataset.csv"
+OSCARS_PATH = "full_data.csv"          # tab-separated, has IMDb FilmId
+BUDGET_MIN = 50_000_000                # try 100_000_000 as a robustness check
+PROFIT_MULT = 2.5                      # profitable if gross >= 2.5 x budget
+ANOMALY_SHARE = 0.05                   # gross < 5% of budget = likely streaming/limited release
+DROP_ANOMALIES = True
+OUT_PATH = "clean_high_budget.csv"
+
+# ============================ HELPERS =======================================
+def norm(s):
+    """lowercase, strip accents/punctuation: 'Alejandro G. Iñárritu' -> 'alejandro g inarritu'."""
+    s = unicodedata.normalize("NFKD", str(s))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = re.sub(r"[^a-z0-9 ]", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+def usd_to_float(x):
+    """'$100,000,000 (estimated)' -> 1e8; anything not starting with '$' -> NaN (drops CA$, A$, EUR, etc.)."""
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip()
+    if not s.startswith("$"):
+        return np.nan
+    digits = "".join(ch for ch in s.split("(")[0] if ch.isdigit())
+    return float(digits) if digits else np.nan
+
+def parse_list(x):
+    if pd.isna(x):
+        return []
+    try:
+        v = ast.literal_eval(str(x))
+        return [str(a).strip() for a in v] if isinstance(v, (list, tuple)) else [str(v).strip()]
+    except (ValueError, SyntaxError):
+        return [str(x).strip("[]'\" ")]
+
+def votes_to_num(x):
+    if pd.isna(x):
+        return np.nan
+    m = re.match(r"^([\d.]+)\s*([KkMm]?)$", str(x).strip())
+    if not m:
+        return np.nan
+    return float(m.group(1)) * {"": 1, "k": 1e3, "m": 1e6}[m.group(2).lower()]
+
+def duration_to_min(x):
+    if pd.isna(x):
+        return np.nan
+    h = re.search(r"(\d+)\s*h", str(x))
+    m = re.search(r"(\d+)\s*m", str(x))
+    if not (h or m):
+        return np.nan
+    return (int(h.group(1)) * 60 if h else 0) + (int(m.group(1)) if m else 0)
+
+# ============================ 1. CLEAN MOVIES ===============================
+df = pd.read_csv(MOVIES_PATH, low_memory=False)
+n_raw = len(df)
+
+df["budget_usd"] = df["budget"].map(usd_to_float)
+df["gross_usd"] = df["gross_worldwide"].map(usd_to_float)
+df["release_date"] = pd.to_datetime(df["release_date"], errors="coerce")
+df["year"] = df["release_date"].dt.year
+df["dir_list"] = df["directors"].map(parse_list)
+df["director"] = df["dir_list"].map(lambda l: l[0] if l else np.nan)
+df["dir_keys"] = df["dir_list"].map(lambda l: [norm(a) for a in l])
+df["votes_n"] = df["votes"].map(votes_to_num)
+df["runtime_min"] = df["duration"].map(duration_to_min)
+
+for g in ["Action", "Adventure", "Animation", "Comedy", "Crime", "Drama", "Fantasy",
+          "Horror", "Romance", "Sci-Fi", "Thriller", "Family"]:
+    df["g_" + g.lower().replace("-", "")] = df["genres"].map(
+        lambda x, g=g: int(g in parse_list(x)))
+
+df["mpa_group"] = df["mpa"].where(df["mpa"].isin(["G", "PG", "PG-13", "R"]), "Other")
+
+# Keep every film with a director + date so director history uses the full career
+df_clean = df.dropna(subset=["director", "release_date"]).copy()
+df_clean = df_clean.drop_duplicates("id")
+
+# ============================ 2. TRACK-RECORD STAR POWER ====================
+# Sorted chronologically per (first) director; subtract the current row so a film never sees itself.
+df_clean = df_clean.sort_values(["director", "release_date", "id"]).reset_index(drop=True)
+by_dir = df_clean["director"]
+
+df_clean["prior_films"] = df_clean.groupby("director", sort=False).cumcount()
+
+def prior_mean(series):
+    s0 = series.fillna(0)
+    n = series.notna().astype(int)
+    return (s0.groupby(by_dir).cumsum() - s0) / (n.groupby(by_dir).cumsum() - n).replace(0, np.nan)
+
+df_clean["prior_avg_rating"] = prior_mean(df_clean["rating"])
+df_clean["prior_avg_gross"] = prior_mean(df_clean["gross_usd"])
+
+both = df_clean["budget_usd"].notna() & df_clean["gross_usd"].notna()
+hit = (df_clean["gross_usd"] >= PROFIT_MULT * df_clean["budget_usd"]).astype(float).where(both)
+h0, hn = hit.fillna(0), both.astype(int)
+df_clean["prior_hit_rate"] = (h0.groupby(by_dir).cumsum() - h0) / (hn.groupby(by_dir).cumsum() - hn).replace(0, np.nan)
+
+# ============================ 3. OSCAR DIRECTING HISTORY ====================
+osc = pd.read_csv(OSCARS_PATH, sep="\t", dtype=str)
+osc = osc[osc["CanonicalCategory"] == "DIRECTING"].copy()
+osc["ceremony_year"] = 1928 + osc["Ceremony"].astype(int)     # 1st ceremony (1927/28 films) held in 1929
+osc["win"] = (osc["Winner"] == "True").astype(int)
+
+film_dirs = df.drop_duplicates("id").set_index("id")["dir_keys"].to_dict()
+
+def resolve(nominee_keys, film_keys):
+    """Map an Oscar nominee to the director spelling used in the movie file (via the IMDb film ID)."""
+    if not film_keys:
+        return nominee_keys
+    hit_ = [k for k in nominee_keys if k in film_keys]
+    if hit_:
+        return hit_
+    last = {k.split()[-1] for k in nominee_keys if k}
+    hit_ = [k for k in film_keys if k and k.split()[-1] in last]   # Francis Coppola -> Francis Ford Coppola
+    if hit_:
+        return hit_
+    return film_keys if len(film_keys) == 1 else nominee_keys
+
+rows, n_id_found, n_direct = [], 0, 0
+for _, r in osc.iterrows():
+    nominee_keys = [norm(n) for n in re.split(r",\s*|\s+and\s+|\s*&\s*", r["Name"])]
+    for fid in str(r["FilmId"]).split("|"):
+        fkeys = film_dirs.get(fid)
+        n_id_found += fkeys is not None
+        n_direct += bool(fkeys) and any(k in fkeys for k in nominee_keys)
+        for person in resolve(nominee_keys, fkeys):
+            rows.append((person, r["ceremony_year"], r["Category"], r["win"]))
+
+osc_long = (pd.DataFrame(rows, columns=["person", "ceremony_year", "category", "win"])
+            .drop_duplicates())                               # one nomination per person per ceremony
+
+# Film-director pairs -> nominations/wins from ceremonies BEFORE the film's release year
+pairs = df_clean[["id", "year", "dir_keys"]].explode("dir_keys").rename(columns={"dir_keys": "person"})
+pairs = pairs.merge(osc_long, on="person", how="left")
+prior = pairs[pairs["ceremony_year"] < pairs["year"]]
+agg = (prior.groupby(["id", "person"]).agg(noms=("win", "size"), wins=("win", "sum"))
+       .groupby("id").max())                                  # best-credentialed director on the film
+
+df_clean = df_clean.merge(agg.rename(columns={"noms": "oscar_prior_noms", "wins": "oscar_prior_wins"}),
+                          left_on="id", right_index=True, how="left")
+df_clean[["oscar_prior_noms", "oscar_prior_wins"]] = df_clean[["oscar_prior_noms", "oscar_prior_wins"]].fillna(0).astype(int)
+df_clean["oscar_prior_nominee"] = (df_clean["oscar_prior_noms"] > 0).astype(int)
+
+# ============================ 4. HIGH-BUDGET SAMPLE + TARGETS ===============
+hb = df_clean.dropna(subset=["budget_usd", "gross_usd"])
+hb = hb[(hb["budget_usd"] >= BUDGET_MIN) & (hb["gross_usd"] > 0)].copy()
+hb["theatrical_anomaly"] = (hb["gross_usd"] < ANOMALY_SHARE * hb["budget_usd"]).astype(int)
+n_before_anom = len(hb)
+if DROP_ANOMALIES:
+    hb = hb[hb["theatrical_anomaly"] == 0].copy()
+
+hb["is_profitable"] = (hb["gross_usd"] >= PROFIT_MULT * hb["budget_usd"]).astype(int)
+hb["roi"] = (hb["gross_usd"] - hb["budget_usd"]) / hb["budget_usd"]
+hb["log_roi"] = np.log1p(hb["roi"])
+hb["log_budget"] = np.log(hb["budget_usd"])
+hb["debut_director"] = (hb["prior_films"] == 0).astype(int)
+
+keep = (["id", "title", "director", "year", "release_date", "budget_usd", "log_budget", "gross_usd",
+         "is_profitable", "roi", "log_roi",
+         "prior_films", "debut_director", "prior_avg_rating", "prior_avg_gross", "prior_hit_rate",
+         "oscar_prior_noms", "oscar_prior_wins", "oscar_prior_nominee",
+         "mpa_group", "runtime_min", "rating", "votes_n"]
+        + [c for c in hb.columns if c.startswith("g_")])
+hb[keep].to_csv(OUT_PATH, index=False)
+
+# ============================ 5. DATA-QUALITY / MERGE LOG ===================
+print("=== MOVIE CLEANING ===")
+print(f"raw rows: {n_raw:,} | with director+date: {len(df_clean):,}")
+print(f"USD budget known: {df['budget_usd'].notna().sum():,} | USD gross known: {df['gross_usd'].notna().sum():,}")
+print(f"high-budget USD sample (>= ${BUDGET_MIN:,.0f}): {n_before_anom:,} | "
+      f"theatrical anomalies (gross < {ANOMALY_SHARE:.0%} of budget): {n_before_anom - len(hb) if DROP_ANOMALIES else int(hb['theatrical_anomaly'].sum())}")
+print(f"FINAL sample: {len(hb):,} films, {hb['year'].min()}-{hb['year'].max()}, "
+      f"{hb['director'].nunique():,} directors, profitable rate {hb['is_profitable'].mean():.1%}")
+print("\n=== OSCAR MERGE (key = IMDb film ID, then director name) ===")
+print(f"Oscar directing nominations: {len(osc):,}")
+total_ids = sum(len(str(f).split("|")) for f in osc["FilmId"])
+print(f"nominated film IDs found in movie file: {n_id_found}/{total_ids}")
+print(f"nominee name matches movie director list directly: {n_direct}")
+print(f"distinct Oscar-nominated directors tracked: {osc_long['person'].nunique():,}")
+print(f"final sample films whose director had a PRIOR Oscar nomination: "
+      f"{hb['oscar_prior_nominee'].sum():,} ({hb['oscar_prior_nominee'].mean():.1%}); "
+      f"prior winners: {(hb['oscar_prior_wins'] > 0).sum():,}")
+print(f"debut directors: {hb['debut_director'].mean():.1%}")
